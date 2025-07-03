@@ -23,6 +23,7 @@ import {
     TrustServerCertDialogProps,
     ConnectionDialogFormItemSpec,
     ConnectionStringDialogProps,
+    GetConnectionDisplayNameRequest,
 } from "../sharedInterfaces/connectionDialog";
 import { ConnectionCompleteParams } from "../models/contracts/connection";
 import { FormItemActionButton, FormItemOptions } from "../sharedInterfaces/form";
@@ -54,6 +55,7 @@ import { getErrorMessage } from "../utils/utils";
 import { l10n } from "vscode";
 import {
     CredentialsQuickPickItemType,
+    IConnectionGroup,
     IConnectionProfile,
     IConnectionProfileWithSource,
 } from "../models/interfaces";
@@ -68,6 +70,10 @@ import {
 } from "../constants/constants";
 import { AddFirewallRuleState } from "../sharedInterfaces/addFirewallRule";
 import * as Utils from "../models/utils";
+import {
+    createConnectionGroup,
+    getDefaultConnectionGroupDialogProps,
+} from "../controllers/connectionGroupWebviewController";
 
 export class ConnectionDialogWebviewController extends FormWebviewController<
     IConnectionDialogProfile,
@@ -103,6 +109,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         private _mainController: MainController,
         private _objectExplorerProvider: ObjectExplorerProvider,
         connectionToEdit?: IConnectionInfo,
+        initialConnectionGroup?: IConnectionGroup,
     ) {
         super(
             context,
@@ -129,7 +136,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         );
 
         this.registerRpcHandlers();
-        void this.initializeDialog(connectionToEdit)
+        void this.initializeDialog(connectionToEdit, initialConnectionGroup)
             .then(() => {
                 this.updateState();
                 this.initialized.resolve();
@@ -151,12 +158,16 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             });
     }
 
-    private async initializeDialog(connectionToEdit: IConnectionInfo) {
+    private async initializeDialog(
+        connectionToEdit: IConnectionInfo,
+        initialConnectionGroup?: IConnectionGroup,
+    ) {
         // Load connection form components
         this.state.formComponents = await generateConnectionComponents(
             this._mainController.connectionManager,
             getAccounts(this._mainController.azureAccountService, this.logger),
             this.getAzureActionButtons(),
+            this.getConnectionGroups(this._mainController),
         );
 
         this.state.connectionComponents = {
@@ -211,6 +222,10 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
                     "loadConnectionToEdit", // errorType
                 );
             }
+        }
+
+        if (initialConnectionGroup) {
+            this.state.connectionProfile.groupId = initialConnectionGroup.id;
         }
 
         await this.updateItemVisibility();
@@ -290,6 +305,35 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             this.updateState(state);
 
             return await this.connectHelper(state);
+        });
+
+        this.registerReducer("createConnectionGroup", async (state, payload) => {
+            const createConnectionGroupResult: IConnectionGroup | string =
+                await createConnectionGroup(
+                    payload.connectionGroupSpec,
+                    this._mainController.connectionManager,
+                    TelemetryViews.ConnectionDialog,
+                );
+            if (typeof createConnectionGroupResult === "string") {
+                // If the result is a string, it means there was an error creating the group
+                state.formError = createConnectionGroupResult;
+            } else {
+                // If the result is an IConnectionGroup, it means the group was created successfully
+                state.connectionProfile.groupId = createConnectionGroupResult.id;
+            }
+
+            state.formComponents.groupId.options =
+                await this._mainController.connectionManager.connectionUI.getConnectionGroupOptions();
+
+            state.dialog = undefined;
+
+            this.updateState(state);
+
+            return await this.connectHelper(state);
+        });
+
+        this.registerReducer("openCreateConnectionGroupDialog", async (state) => {
+            return getDefaultConnectionGroupDialogProps(state) as ConnectionDialogWebviewState;
         });
 
         this.registerReducer("closeDialog", async (state) => {
@@ -464,8 +508,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
 
             return state;
         });
-
-        this.registerRequestHandler("getConnectionDisplayName", async (payload) => {
+        this.onRequest(GetConnectionDisplayNameRequest.type, async (payload) => {
             return getConnectionDisplayName(payload);
         });
 
@@ -535,7 +578,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             state.selectedInputMode === ConnectionInputMode.Parameters ||
             state.selectedInputMode === ConnectionInputMode.AzureBrowse
         ) {
-            return state.connectionComponents.mainOptions;
+            return [...state.connectionComponents.mainOptions, "groupId"];
         }
         return ["connectionString", "profileName"];
     }
@@ -731,16 +774,19 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             this.updateState();
 
             this.state.connectionStatus = ApiStatus.Loaded;
+
             await this._mainController.objectExplorerTree.reveal(node, {
                 focus: true,
                 select: true,
                 expand: true,
             });
+
             await this.panel.dispose();
             this.dispose();
             UserSurvey.getInstance().promptUserForNPSFeedback();
         } catch (error) {
             this.state.connectionStatus = ApiStatus.Error;
+            this.state.formError = getErrorMessage(error);
 
             sendErrorEvent(
                 TelemetryViews.ConnectionDialog,
@@ -914,6 +960,10 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
                 id: t.tenantId,
             };
         });
+    }
+
+    private async getConnectionGroups(mainController: MainController): Promise<FormItemOptions[]> {
+        return mainController.connectionManager.connectionUI.getConnectionGroupOptions();
     }
 
     private async getAzureActionButtons(): Promise<FormItemActionButton[]> {
