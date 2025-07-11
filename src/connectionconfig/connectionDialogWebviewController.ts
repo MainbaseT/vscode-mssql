@@ -23,6 +23,7 @@ import {
     TrustServerCertDialogProps,
     ConnectionDialogFormItemSpec,
     ConnectionStringDialogProps,
+    GetConnectionDisplayNameRequest,
 } from "../sharedInterfaces/connectionDialog";
 import { ConnectionCompleteParams } from "../models/contracts/connection";
 import { FormItemActionButton, FormItemOptions } from "../sharedInterfaces/form";
@@ -33,11 +34,10 @@ import {
     refreshTokenLabel,
 } from "../constants/locConstants";
 import {
-    confirmVscodeAzureSignin,
-    fetchServersFromAzure,
     getAccounts,
     getTenants,
     promptForAzureSubscriptionFilter,
+    VsCodeAzureHelper,
 } from "./azureHelpers";
 import { sendActionEvent, sendErrorEvent, startActivity } from "../telemetry/telemetry";
 
@@ -50,10 +50,11 @@ import { ObjectExplorerProvider } from "../objectExplorer/objectExplorerProvider
 import { UserSurvey } from "../nps/userSurvey";
 import VscodeWrapper from "../controllers/vscodeWrapper";
 import { getConnectionDisplayName } from "../models/connectionInfo";
-import { getErrorMessage } from "../utils/utils";
+import { getErrorMessage, groupBy } from "../utils/utils";
 import { l10n } from "vscode";
 import {
     CredentialsQuickPickItemType,
+    IConnectionGroup,
     IConnectionProfile,
     IConnectionProfileWithSource,
 } from "../models/interfaces";
@@ -68,6 +69,12 @@ import {
 } from "../constants/constants";
 import { AddFirewallRuleState } from "../sharedInterfaces/addFirewallRule";
 import * as Utils from "../models/utils";
+import {
+    createConnectionGroup,
+    getDefaultConnectionGroupDialogProps,
+} from "../controllers/connectionGroupWebviewController";
+import { populateAzureAccountInfo } from "../controllers/addFirewallRuleWebviewController";
+import { MssqlVSCodeAzureSubscriptionProvider } from "../azure/MssqlVSCodeAzureSubscriptionProvider";
 
 export class ConnectionDialogWebviewController extends FormWebviewController<
     IConnectionDialogProfile,
@@ -103,6 +110,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         private _mainController: MainController,
         private _objectExplorerProvider: ObjectExplorerProvider,
         connectionToEdit?: IConnectionInfo,
+        initialConnectionGroup?: IConnectionGroup,
     ) {
         super(
             context,
@@ -129,7 +137,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         );
 
         this.registerRpcHandlers();
-        void this.initializeDialog(connectionToEdit)
+        void this.initializeDialog(connectionToEdit, initialConnectionGroup)
             .then(() => {
                 this.updateState();
                 this.initialized.resolve();
@@ -151,12 +159,16 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             });
     }
 
-    private async initializeDialog(connectionToEdit: IConnectionInfo) {
+    private async initializeDialog(
+        connectionToEdit: IConnectionInfo,
+        initialConnectionGroup?: IConnectionGroup,
+    ) {
         // Load connection form components
         this.state.formComponents = await generateConnectionComponents(
             this._mainController.connectionManager,
             getAccounts(this._mainController.azureAccountService, this.logger),
             this.getAzureActionButtons(),
+            this.getConnectionGroups(this._mainController),
         );
 
         this.state.connectionComponents = {
@@ -213,16 +225,32 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             }
         }
 
+        if (initialConnectionGroup) {
+            this.state.connectionProfile.groupId = initialConnectionGroup.id;
+        }
+
         await this.updateItemVisibility();
+
+        this.state.azureAccounts = (await VsCodeAzureHelper.getAccounts()).map((a) => a.label);
+        this.state.loadingAzureAccountsStatus =
+            this.state.azureAccounts.length === 0 ? ApiStatus.NotStarted : ApiStatus.Loaded;
+        this.updateState();
     }
 
     private registerRpcHandlers() {
         this.registerReducer("setConnectionInputType", async (state, payload) => {
             this.state.selectedInputMode = payload.inputMode;
             await this.updateItemVisibility();
+            state.formError = "";
             this.updateState();
 
-            if (this.state.selectedInputMode === ConnectionInputMode.AzureBrowse) {
+            if (
+                state.selectedInputMode === ConnectionInputMode.AzureBrowse &&
+                (state.loadingAzureSubscriptionsStatus === ApiStatus.NotStarted ||
+                    state.loadingAzureSubscriptionsStatus === ApiStatus.Error) &&
+                (state.loadingAzureServersStatus === ApiStatus.NotStarted ||
+                    state.loadingAzureServersStatus === ApiStatus.Error)
+            ) {
                 await this.loadAllAzureServers(state);
             }
 
@@ -257,7 +285,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         });
 
         this.registerReducer("addFirewallRule", async (state, payload) => {
-            (state.dialog as AddFirewallRuleDialogProps).props.addFirewallRuleState =
+            (state.dialog as AddFirewallRuleDialogProps).props.addFirewallRuleStatus =
                 ApiStatus.Loading;
             this.updateState(state);
 
@@ -292,8 +320,42 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             return await this.connectHelper(state);
         });
 
+        this.registerReducer("createConnectionGroup", async (state, payload) => {
+            const createConnectionGroupResult: IConnectionGroup | string =
+                await createConnectionGroup(
+                    payload.connectionGroupSpec,
+                    this._mainController.connectionManager,
+                    TelemetryViews.ConnectionDialog,
+                );
+            if (typeof createConnectionGroupResult === "string") {
+                // If the result is a string, it means there was an error creating the group
+                state.formError = createConnectionGroupResult;
+            } else {
+                // If the result is an IConnectionGroup, it means the group was created successfully
+                state.connectionProfile.groupId = createConnectionGroupResult.id;
+            }
+
+            state.formComponents.groupId.options =
+                await this._mainController.connectionManager.connectionUI.getConnectionGroupOptions();
+
+            state.dialog = undefined;
+
+            this.updateState(state);
+
+            return await this.connectHelper(state);
+        });
+
+        this.registerReducer("openCreateConnectionGroupDialog", async (state) => {
+            return getDefaultConnectionGroupDialogProps(state) as ConnectionDialogWebviewState;
+        });
+
         this.registerReducer("closeDialog", async (state) => {
             state.dialog = undefined;
+            return state;
+        });
+
+        this.registerReducer("closeMessage", async (state) => {
+            state.formError = undefined;
             return state;
         });
 
@@ -414,6 +476,12 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         });
 
         this.registerReducer("openConnectionStringDialog", async (state) => {
+            if (state.selectedInputMode !== ConnectionInputMode.Parameters) {
+                state.selectedInputMode = ConnectionInputMode.Parameters;
+                state.formError = undefined;
+                this.updateState(state);
+            }
+
             try {
                 let connectionString = "";
 
@@ -464,8 +532,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
 
             return state;
         });
-
-        this.registerRequestHandler("getConnectionDisplayName", async (payload) => {
+        this.onRequest(GetConnectionDisplayNameRequest.type, async (payload) => {
             return getConnectionDisplayName(payload);
         });
 
@@ -474,7 +541,40 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
                 return state;
             }
 
-            await this.populateTentants((state.dialog as AddFirewallRuleDialogProps).props);
+            await populateAzureAccountInfo(
+                (state.dialog as AddFirewallRuleDialogProps).props,
+                true /* forceSignInPrompt */,
+            );
+
+            return state;
+        });
+
+        this.registerReducer("signIntoAzureForBrowse", async (state) => {
+            if (state.selectedInputMode !== ConnectionInputMode.AzureBrowse) {
+                state.selectedInputMode = ConnectionInputMode.AzureBrowse;
+                state.formError = undefined;
+                this.updateState(state);
+            }
+
+            if (state.loadingAzureAccountsStatus === ApiStatus.NotStarted) {
+                state.loadingAzureAccountsStatus = ApiStatus.Loading;
+                this.updateState(state);
+            }
+
+            try {
+                await VsCodeAzureHelper.signIn(true /* forceSignInPrompt */);
+            } catch (error) {
+                this.logger.error("Error signing into Azure: " + getErrorMessage(error));
+                state.formError = LocAzure.errorSigningIntoAzure(getErrorMessage(error));
+
+                return state;
+            }
+
+            state.azureAccounts = (await VsCodeAzureHelper.getAccounts()).map((a) => a.label);
+            state.loadingAzureAccountsStatus = ApiStatus.Loaded;
+            this.updateState(state);
+
+            await this.loadAllAzureServers(state);
 
             return state;
         });
@@ -535,7 +635,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             state.selectedInputMode === ConnectionInputMode.Parameters ||
             state.selectedInputMode === ConnectionInputMode.AzureBrowse
         ) {
-            return state.connectionComponents.mainOptions;
+            return [...state.connectionComponents.mainOptions, "groupId"];
         }
         return ["connectionString", "profileName"];
     }
@@ -731,16 +831,19 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             this.updateState();
 
             this.state.connectionStatus = ApiStatus.Loaded;
+
             await this._mainController.objectExplorerTree.reveal(node, {
                 focus: true,
                 select: true,
                 expand: true,
             });
+
             await this.panel.dispose();
             this.dispose();
             UserSurvey.getInstance().promptUserForNPSFeedback();
         } catch (error) {
             this.state.connectionStatus = ApiStatus.Error;
+            this.state.formError = getErrorMessage(error);
 
             sendErrorEvent(
                 TelemetryViews.ConnectionDialog,
@@ -798,23 +901,28 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
                 handleFirewallErrorResult.ipAddress = "0.0.0.0";
             }
 
-            const auth = await confirmVscodeAzureSignin();
-            const tenants = await auth.getTenants();
+            const addFirewallDialogState: AddFirewallRuleState = {
+                message: result.errorMessage,
+                clientIp: handleFirewallErrorResult.ipAddress,
+                accounts: [],
+                tenants: {},
+                isSignedIn: true,
+                serverName: this.state.connectionProfile.server,
+                addFirewallRuleStatus: ApiStatus.NotStarted,
+            };
+
+            if (addFirewallDialogState.isSignedIn) {
+                await populateAzureAccountInfo(
+                    addFirewallDialogState,
+                    false /* forceSignInPrompt */,
+                );
+            }
+
+            addFirewallDialogState.isSignedIn = await VsCodeAzureHelper.isSignedIn();
 
             this.state.dialog = {
                 type: "addFirewallRule",
-                props: {
-                    message: result.errorMessage,
-                    clientIp: handleFirewallErrorResult.ipAddress,
-                    tenants: tenants.map((t) => {
-                        return {
-                            name: t.displayName,
-                            id: t.tenantId,
-                        };
-                    }),
-                    isSignedIn: true,
-                    serverName: this.state.connectionProfile.server,
-                },
+                props: addFirewallDialogState,
             } as AddFirewallRuleDialogProps;
 
             return state;
@@ -893,27 +1001,8 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
 
     //#region Azure helpers
 
-    public async populateTentants(state: AddFirewallRuleState): Promise<void> {
-        const auth = await confirmVscodeAzureSignin();
-
-        if (!auth) {
-            const errorMessage = LocAzure.azureSignInFailedOrWasCancelled;
-
-            this.logger.error(errorMessage);
-            this.vscodeWrapper.showErrorMessage(errorMessage);
-
-            return;
-        }
-
-        const tenants = await auth.getTenants();
-
-        state.isSignedIn = true;
-        state.tenants = tenants.map((t) => {
-            return {
-                name: t.displayName,
-                id: t.tenantId,
-            };
-        });
+    private async getConnectionGroups(mainController: MainController): Promise<FormItemOptions[]> {
+        return mainController.connectionManager.connectionUI.getConnectionGroupOptions();
     }
 
     private async getAzureActionButtons(): Promise<FormItemActionButton[]> {
@@ -1080,15 +1169,19 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
     private async loadAzureSubscriptions(
         state: ConnectionDialogWebviewState,
     ): Promise<Map<string, AzureSubscription[]> | undefined> {
-        let endActivity: ActivityObject;
+        let telemActivity: ActivityObject;
         try {
-            const auth = await confirmVscodeAzureSignin();
-
-            if (!auth) {
-                state.formError = l10n.t("Azure sign in failed.");
+            let auth: MssqlVSCodeAzureSubscriptionProvider;
+            try {
+                auth = await VsCodeAzureHelper.signIn();
+            } catch (error) {
+                state.formError = LocAzure.errorSigningIntoAzure(getErrorMessage(error));
                 return undefined;
             }
 
+            state.formError = "";
+            state.azureAccounts = (await VsCodeAzureHelper.getAccounts()).map((a) => a.label);
+            state.loadingAzureAccountsStatus = ApiStatus.Loaded;
             state.loadingAzureSubscriptionsStatus = ApiStatus.Loading;
             this.updateState();
 
@@ -1099,7 +1192,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
                     .getConfiguration()
                     .get<string[] | undefined>(configSelectedAzureSubscriptions) !== undefined;
 
-            endActivity = startActivity(
+            telemActivity = startActivity(
                 TelemetryViews.ConnectionDialog,
                 TelemetryActions.LoadAzureSubscriptions,
             );
@@ -1107,10 +1200,10 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             this._azureSubscriptions = new Map(
                 (await auth.getSubscriptions(shouldUseFilter)).map((s) => [s.subscriptionId, s]),
             );
-            const tenantSubMap = this.groupBy<string, AzureSubscription>(
+            const tenantSubMap = groupBy<string, AzureSubscription>(
                 Array.from(this._azureSubscriptions.values()),
                 "tenantId",
-            ); // TODO: replace with Object.groupBy once ES2024 is supported
+            );
 
             const subs: AzureSubscriptionInfo[] = [];
 
@@ -1127,7 +1220,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
             state.azureSubscriptions = subs;
             state.loadingAzureSubscriptionsStatus = ApiStatus.Loaded;
 
-            endActivity.end(
+            telemActivity.end(
                 ActivityStatus.Succeeded,
                 undefined, // additionalProperties
                 {
@@ -1140,8 +1233,8 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         } catch (error) {
             state.formError = l10n.t("Error loading Azure subscriptions.");
             state.loadingAzureSubscriptionsStatus = ApiStatus.Error;
-            console.error(state.formError + "\n" + getErrorMessage(error));
-            endActivity.endFailed(error, false);
+            this.logger.error(state.formError + "\n" + getErrorMessage(error));
+            telemActivity?.endFailed(error, false);
             return undefined;
         }
     }
@@ -1207,7 +1300,7 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         const stateSub = state.azureSubscriptions.find((s) => s.id === subscriptionId);
 
         try {
-            const servers = await fetchServersFromAzure(azSub);
+            const servers = await VsCodeAzureHelper.fetchServersFromAzure(azSub);
             state.azureServers.push(...servers);
             stateSub.loaded = true;
             this.updateState();
@@ -1242,17 +1335,6 @@ export class ConnectionDialogWebviewController extends FormWebviewController<
         )) {
             component.validation = undefined;
         }
-    }
-
-    private groupBy<K, V>(values: V[], key: keyof V): Map<K, V[]> {
-        return values.reduce((rv, x) => {
-            const keyValue = x[key] as K;
-            if (!rv.has(keyValue)) {
-                rv.set(keyValue, []);
-            }
-            rv.get(keyValue)!.push(x);
-            return rv;
-        }, new Map<K, V[]>());
     }
 
     private async hydrateConnectionDetailsFromProfile(

@@ -15,7 +15,7 @@ import SqlToolsServerClient from "./languageservice/serviceclient";
 import { ConnectionProfile } from "./models/connectionProfile";
 import { FirewallRuleError } from "./languageservice/interfaces";
 import { RequestType } from "vscode-languageclient";
-import { createSqlAgentRequestHandler, ISqlChatResult } from "./chat/chatAgentRequestHandler";
+import { createSqlAgentRequestHandler, ISqlChatResult } from "./copilot/chatAgentRequestHandler";
 import { sendActionEvent } from "./telemetry/telemetry";
 import { TelemetryActions, TelemetryViews } from "./sharedInterfaces/telemetry";
 import { ChatResultFeedbackKind } from "vscode";
@@ -49,6 +49,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<IExten
     const participant = vscode.chat.createChatParticipant(
         "mssql.agent",
         createSqlAgentRequestHandler(controller.copilotService, vscodeWrapper, context, controller),
+    );
+    participant.iconPath = vscode.Uri.joinPath(
+        context.extensionUri,
+        "images",
+        "mssql-chat-avatar.jpg",
     );
 
     const receiveFeedbackDisposable = participant.onDidReceiveFeedback(
@@ -138,6 +143,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<IExten
         },
         getServerInfo: (connectionInfo: IConnectionInfo) => {
             return controller.connectionManager.getServerInfo(connectionInfo);
+        },
+        connectionSharing: <vscodeMssql.IConnectionSharingService>{
+            getActiveEditorConnectionId: (extensionId: string) => {
+                return controller.connectionSharingService.getActiveEditorConnectionId(extensionId);
+            },
+            connect: async (extensionId: string, connectionId: string): Promise<string> => {
+                return controller.connectionSharingService.connect(extensionId, connectionId);
+            },
+            disconnect: (connectionUri: string): void => {
+                return controller.connectionSharingService.disconnect(connectionUri);
+            },
+            isConnected: (connectionUri: string): boolean => {
+                return controller.connectionSharingService.isConnected(connectionUri);
+            },
+            executeSimpleQuery: (
+                connectionUri: string,
+                queryString: string,
+            ): Promise<vscodeMssql.SimpleExecuteResult> => {
+                return controller.connectionSharingService.executeSimpleQuery(
+                    connectionUri,
+                    queryString,
+                );
+            },
+            getServerInfo: (connectionUri: string): vscodeMssql.IServerInfo => {
+                return controller.connectionSharingService.getServerInfo(connectionUri);
+            },
+            listDatabases: (connectionUri: string): Promise<string[]> => {
+                return controller.connectionSharingService.listDatabases(connectionUri);
+            },
+            scriptObject: (connectionUri, operation, scriptingObject) => {
+                return controller.connectionSharingService.scriptObject(
+                    connectionUri,
+                    operation,
+                    scriptingObject,
+                );
+            },
         },
     };
 }
